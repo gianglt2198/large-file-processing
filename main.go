@@ -1,83 +1,101 @@
 package main
 
 import (
-	"bytes"
-	"crypto/rand"
-	"encoding/binary"
-	"fmt"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"log"
-	"net"
-	"time"
+	"os"
+	"path/filepath"
 )
 
-type FileServer struct {
-}
+const (
+	serverAddr = ":3000"
+)
 
-func (fs *FileServer) start() {
-	ln, err := net.Listen("tcp", ":3000")
+// func main() {
+// Demo example processing large file
+// go func() {
+// 	time.Sleep(4 * time.Second)
+// 	sendFile(33 * 1024)
+// }()
+// server := &FileServer{}
+// server.start()
+// }
+
+func main() {
+	// Create temporary directories
+	serverTemp, err := os.MkdirTemp(".", "server")
 	if err != nil {
 		log.Fatal(err)
 	}
+	defer os.RemoveAll(serverTemp)
 
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		go fs.readLoop(conn)
-	}
-}
-
-func (fs *FileServer) readLoop(conn net.Conn) {
-	buf := new(bytes.Buffer)
-	for {
-		var size int64
-		binary.Read(conn, binary.LittleEndian, &size)
-		n, err := io.CopyN(buf, conn, size)
-		// n, err := conn.Read(buf)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// f := buf[:n]
-
-		// fmt.Println(buf.Bytes())
-		fmt.Printf("received %d bytes over the network\n", n)
-	}
-}
-
-func sendFile(size int) error {
-	f := make([]byte, size)
-	_, err := io.ReadFull(rand.Reader, f)
+	clientTemp, err := os.MkdirTemp(".", "client")
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
+	defer os.RemoveAll(clientTemp)
 
-	conn, err := net.Dial("tcp", ":3000")
+	// Generate test file
+	testFile := filepath.Join(clientTemp, "testfile.dat")
+	testFileSize := int64(100 * 1024 * 1024) // 100MB test file
+
+	log.Printf("Generating test file of size: %d bytes", testFileSize)
+	checksum, err := generateTestFile(testFile, testFileSize)
 	if err != nil {
-		return err
+		log.Fatal(err)
 	}
+	defer os.Remove(testFile)
+	log.Printf("Generated test file: %s with checksum: %s", testFile, checksum)
 
-	binary.Write(conn, binary.LittleEndian, int64(size))
-	n, err := io.CopyN(conn, bytes.NewReader(f), int64(size))
-	// n, err := conn.Write(f)
-	if err != nil {
-		return err
-	}
+	// Start server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	fmt.Printf("written %d bytes over the network\n", n)
-	return nil
-}
-
-func main() {
+	server := NewRealFileServer(serverTemp)
+	serverReady := make(chan struct{})
 
 	go func() {
-		time.Sleep(4 * time.Second)
-		sendFile(33 * 1024)
+		if err := server.Start(ctx, serverAddr, serverReady); err != nil {
+			log.Printf("Server error: %v", err)
+		}
 	}()
-	server := &FileServer{}
-	server.start()
 
+	// Wait for server to be ready
+	<-serverReady
+
+	// Start file transfer
+	log.Printf("Starting file transfer...")
+	if err := sendTempFile(ctx, testFile, serverAddr); err != nil {
+		log.Fatal(err)
+	}
+
+	// Verify transfer
+	serverFile := filepath.Join(serverTemp, filepath.Base(testFile))
+	if _, err := os.Stat(serverFile); err != nil {
+		log.Fatal("Transfer verification failed: file not found on server")
+	}
+
+	// Calculate received file checksum
+	file, err := os.Open(serverFile)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		log.Fatal(err)
+	}
+	receivedChecksum := hex.EncodeToString(hasher.Sum(nil))
+
+	if receivedChecksum != checksum {
+		log.Fatal("Transfer verification failed: checksum mismatch")
+	}
+
+	log.Printf("Transfer completed and verified successfully")
+	log.Printf("Original checksum: %s", checksum)
+	log.Printf("Received checksum: %s", receivedChecksum)
 }
